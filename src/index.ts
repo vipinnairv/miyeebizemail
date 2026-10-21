@@ -1,15 +1,27 @@
 import type { Env } from "./env";
 import { handleInbound } from "./inbound";
 import { handleApi } from "./api";
+import { purgeOlderThan } from "./db";
 
 export default {
   /** Inbound mail from Cloudflare Email Routing. */
-  async email(message, env, ctx) {
-    await handleInbound(message, env, ctx);
+  async email(message, env) {
+    await handleInbound(message, env);
   },
 
-  /** HTTP API for reading stored mail and sending messages. */
+  /**
+   * HTTP API. The web inbox in public/ is served by Workers static assets
+   * before this handler runs, so only non-asset paths (e.g. /api/*) reach it.
+   */
   async fetch(request, env) {
     return handleApi(request, env);
+  },
+
+  /** Daily retention cleanup (cron trigger in wrangler.jsonc). */
+  async scheduled(_controller, env) {
+    const days = Number(env.RETENTION_DAYS) || 30;
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const deleted = await purgeOlderThan(env, cutoff);
+    console.log(JSON.stringify({ event: "retention.purged", deleted, cutoff }));
   },
 } satisfies ExportedHandler<Env>;

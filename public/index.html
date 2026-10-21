@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="robots" content="noindex" />
+    <title>Inbox</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <!-- Sign-in: the API token is kept in this browser only -->
+    <main id="login" class="login" hidden>
+      <form id="login-form" class="login-card">
+        <h1>Inbox</h1>
+        <p class="muted">Enter the API token you set with <code>wrangler secret put API_TOKEN</code>.</p>
+        <label for="token">API token</label>
+        <input id="token" type="password" autocomplete="current-password" required />
+        <p id="login-error" class="error" hidden></p>
+        <button type="submit" class="primary">Sign in</button>
+      </form>
+    </main>
+
+    <div id="app" class="app" hidden>
+      <header class="topbar">
+        <strong class="brand">Inbox</strong>
+        <div class="spacer"></div>
+        <button id="compose-btn" class="primary">Compose</button>
+        <button id="logout-btn" class="ghost">Sign out</button>
+      </header>
+
+      <nav class="folders" aria-label="Folders">
+        <button class="folder" data-folder="inbox" aria-current="true">
+          Inbox <span id="unread" class="badge" hidden></span>
+        </button>
+        <button class="folder" data-folder="sent">Sent</button>
+      </nav>
+
+      <section class="list-pane" aria-label="Messages">
+        <form id="search-form" class="search" role="search">
+          <input id="search" type="search" placeholder="Search mail" aria-label="Search mail" />
+        </form>
+        <ul id="message-list" class="message-list"></ul>
+        <p id="list-empty" class="muted center" hidden>No messages.</p>
+        <button id="load-more" class="ghost full" hidden>Load more</button>
+      </section>
+
+      <section id="reader" class="reader" aria-label="Message">
+        <p id="reader-empty" class="muted center">Select a message to read it.</p>
+        <article id="reader-content" hidden>
+          <div class="reader-actions">
+            <button id="back-btn" class="ghost back">← Back</button>
+            <div class="spacer"></div>
+            <button id="reply-btn" class="ghost">Reply</button>
+            <button id="unread-btn" class="ghost">Mark unread</button>
+            <button id="raw-btn" class="ghost">Original</button>
+            <button id="delete-btn" class="ghost danger">Delete</button>
+          </div>
+          <h2 id="r-subject"></h2>
+          <dl class="meta">
+            <dt>From</dt><dd id="r-from"></dd>
+            <dt>To</dt><dd id="r-to"></dd>
+            <dt id="r-cc-label">Cc</dt><dd id="r-cc"></dd>
+            <dt>Date</dt><dd id="r-date"></dd>
+          </dl>
+          <p id="r-truncated" class="notice" hidden>Part of this message was too large to store. Download the original to see all of it.</p>
+          <ul id="r-attachments" class="attachments"></ul>
+          <div class="body-toggle" id="body-toggle" hidden>
+            <button id="show-html" class="chip" aria-pressed="true">Formatted</button>
+            <button id="show-text" class="chip" aria-pressed="false">Plain text</button>
+          </div>
+          <!-- HTML mail is untrusted: sandboxed, no scripts, remote images blocked by CSP -->
+          <iframe id="r-html" class="html-body" sandbox="allow-popups allow-popups-to-escape-sandbox" title="Message body" hidden></iframe>
+          <pre id="r-text" class="text-body" hidden></pre>
+        </article>
+      </section>
+    </div>
+
+    <dialog id="compose" class="compose">
+      <form id="compose-form" method="dialog">
+        <h2 id="compose-title">New message</h2>
+        <label for="c-to">To</label>
+        <input id="c-to" type="text" placeholder="name@example.com, other@example.com" required />
+        <label for="c-cc">Cc</label>
+        <input id="c-cc" type="text" />
+        <label for="c-subject">Subject</label>
+        <input id="c-subject" type="text" required />
+        <label for="c-body">Message</label>
+        <textarea id="c-body" rows="12" required></textarea>
+        <p id="compose-error" class="error" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" id="compose-cancel" class="ghost">Cancel</button>
+          <button type="submit" id="compose-send" class="primary">Send</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" hidden></div>
+  </body>
+</html>

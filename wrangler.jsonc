@@ -8,6 +8,10 @@
   // and in `npx wrangler tail`.
   "observability": { "enabled": true },
 
+  // The web inbox (public/) is served as static assets. Requests that don't
+  // match a file (e.g. /api/*) fall through to the Worker's fetch handler.
+  "assets": { "directory": "./public" },
+
   // Plain (non-secret) configuration. Secrets such as API_TOKEN are set with
   // `npx wrangler secret put API_TOKEN` and are NOT listed here.
   "vars": {
@@ -20,15 +24,24 @@
     "FORWARD_TO": "",
     // Send an automatic acknowledgement to whoever emails you.
     "AUTO_REPLY": "true",
-    // How long parsed messages are kept in KV.
-    "RETENTION_DAYS": "30"
+    // Messages (and their R2 files) older than this are deleted daily.
+    "RETENTION_DAYS": "90"
   },
 
-  // KV namespace that stores parsed inbound messages.
-  // Create it with `npx wrangler kv namespace create EMAIL_LOG` and paste the id.
-  "kv_namespaces": [
-    { "binding": "EMAIL_LOG", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }
+  // Messages, attachment metadata and full-text search index.
+  // Create with `npx wrangler d1 create miyeebizemail` and paste the id.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "miyeebizemail",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
   ],
+
+  // Original .eml files and attachment bytes.
+  // Create with `npx wrangler r2 bucket create miyeebizemail-mail`.
+  "r2_buckets": [{ "binding": "MAIL_BUCKET", "bucket_name": "miyeebizemail-mail" }],
 
   // Outbound email binding (env.EMAIL.send(...)).
   // Restrict which From addresses this Worker may use. You can also add
@@ -39,5 +52,8 @@
       "name": "EMAIL",
       "allowed_sender_addresses": ["hello@example.com"]
     }
-  ]
+  ],
+
+  // Daily retention cleanup at 03:17 UTC.
+  "triggers": { "crons": ["17 3 * * *"] }
 }
