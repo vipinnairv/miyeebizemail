@@ -33,7 +33,11 @@
         <button class="folder" data-folder="inbox" aria-current="true">
           Inbox <span id="unread" class="badge" hidden></span>
         </button>
+        <button class="folder" data-folder="spam">
+          Spam <span id="spam-unread" class="badge muted-badge" hidden></span>
+        </button>
         <button class="folder" data-folder="sent">Sent</button>
+        <button id="filters-btn" class="folder filters-link">Spam filters</button>
       </nav>
 
       <section class="list-pane" aria-label="Messages">
@@ -53,6 +57,7 @@
             <div class="spacer"></div>
             <button id="reply-btn" class="ghost">Reply</button>
             <button id="unread-btn" class="ghost">Mark unread</button>
+            <button id="spam-btn" class="ghost">Spam</button>
             <button id="raw-btn" class="ghost">Original</button>
             <button id="delete-btn" class="ghost danger">Delete</button>
           </div>
@@ -63,6 +68,13 @@
             <dt id="r-cc-label">Cc</dt><dd id="r-cc"></dd>
             <dt>Date</dt><dd id="r-date"></dd>
           </dl>
+          <div id="r-spam" class="notice spam-notice" hidden>
+            <div>
+              <strong>This message is in Spam.</strong>
+              <ul id="r-spam-reasons"></ul>
+            </div>
+            <button id="not-spam-btn" class="ghost">Not spam</button>
+          </div>
           <p id="r-truncated" class="notice" hidden>Part of this message was too large to store. Download the original to see all of it.</p>
           <ul id="r-attachments" class="attachments"></ul>
           <div class="body-toggle" id="body-toggle" hidden>
@@ -87,12 +99,42 @@
         <input id="c-subject" type="text" required />
         <label for="c-body">Message</label>
         <textarea id="c-body" rows="12" required></textarea>
+        <div class="attach-row">
+          <label for="c-files" class="ghost button attach-label">📎 Attach files</label>
+          <input id="c-files" type="file" multiple class="visually-hidden" />
+          <span class="muted small">Up to 10 files, 10 MB in total</span>
+        </div>
+        <ul id="c-attachments" class="attachments compose-files"></ul>
         <p id="compose-error" class="error" hidden></p>
         <div class="dialog-actions">
           <button type="button" id="compose-cancel" class="ghost">Cancel</button>
           <button type="submit" id="compose-send" class="primary">Send</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog id="filters" class="compose">
+      <h2>Spam filters</h2>
+      <p class="muted">
+        Rules for specific senders override the automatic spam check.
+        <strong>Allow</strong> always delivers to Inbox, <strong>Spam</strong> always goes to Spam,
+        <strong>Block</strong> rejects the email so it is never stored.
+      </p>
+      <form id="rule-form" class="rule-form">
+        <input id="rule-pattern" type="text" placeholder="name@example.com or @example.com" aria-label="Sender address or domain" required />
+        <select id="rule-action" aria-label="Action">
+          <option value="allow">Allow</option>
+          <option value="spam">Spam</option>
+          <option value="block">Block</option>
+        </select>
+        <button type="submit" class="primary">Add</button>
+      </form>
+      <p id="rule-error" class="error" hidden></p>
+      <ul id="rule-list" class="rule-list"></ul>
+      <p id="rule-empty" class="muted" hidden>No rules yet. Marking a message as Spam or Not spam adds one automatically.</p>
+      <div class="dialog-actions">
+        <button type="button" id="filters-close" class="ghost">Close</button>
+      </div>
     </dialog>
 
     <div id="toast" class="toast" role="status" hidden></div>

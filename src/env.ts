@@ -18,6 +18,10 @@ export interface Env {
   AUTO_REPLY: string;
   /** Messages older than this are deleted by the daily cron job. */
   RETENTION_DAYS: string;
+  /** Spam score at or above which inbound mail goes to the Spam folder. */
+  SPAM_THRESHOLD: string;
+  /** Messages in the Spam folder are deleted after this many days. */
+  SPAM_RETENTION_DAYS: string;
 
   /** Secret: bearer token protecting the HTTP API and web inbox. */
   API_TOKEN: string;

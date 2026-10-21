@@ -29,7 +29,12 @@
     // Send an automatic acknowledgement to whoever emails you.
     "AUTO_REPLY": "true",
     // Messages (and their R2 files) older than this are deleted daily.
-    "RETENTION_DAYS": "90"
+    "RETENTION_DAYS": "90",
+    // Inbound mail scoring at or above this goes to the Spam folder (see src/spam.ts).
+    // Lower = stricter. 5 is a balanced starting point.
+    "SPAM_THRESHOLD": "5",
+    // Spam is deleted after this many days.
+    "SPAM_RETENTION_DAYS": "30"
   },
 
   // Messages, attachment metadata and full-text search index.

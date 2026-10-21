@@ -11,8 +11,12 @@ const state = {
   messages: [],
   current: null, // full message open in the reader
   replyTo: null, // message being replied to, or null for a new message
+  files: [], // File objects attached in the compose dialog
   objectUrls: [],
 };
+
+const MAX_FILES = 10;
+const MAX_FILE_BYTES = 10 * 1024 * 1024; // matches the server limit (total, before encoding)
 
 // ---------- token storage (browser storage may be unavailable) ----------
 
@@ -102,6 +106,7 @@ async function loadList({ append = false } = {}) {
   state.messages = append ? [...state.messages, ...data.messages] : data.messages;
   state.cursor = data.cursor;
   setUnread(data.unread);
+  setSpamUnread(data.spamUnread);
   renderList();
 }
 
@@ -110,11 +115,26 @@ function setUnread(count) {
   $("unread").hidden = !count;
 }
 
+function setSpamUnread(count) {
+  $("spam-unread").textContent = String(count);
+  $("spam-unread").hidden = !count;
+}
+
+function adjustUnread(msg, delta) {
+  const badge = msg.isSpam ? "spam-unread" : "unread";
+  const next = Math.max(0, Number($(badge).textContent || 0) + delta);
+  (msg.isSpam ? setSpamUnread : setUnread)(next);
+}
+
 function renderList() {
   const list = $("message-list");
   list.replaceChildren(...state.messages.map(renderItem));
   $("list-empty").hidden = state.messages.length > 0;
-  $("list-empty").textContent = state.query ? "No messages match your search." : "No messages.";
+  $("list-empty").textContent = state.query
+    ? "No messages match your search."
+    : state.folder === "spam"
+      ? "No spam."
+      : "No messages.";
   $("load-more").hidden = !state.cursor;
 }
 
@@ -156,8 +176,7 @@ async function setRead(msg, read) {
   msg.read = read;
   const item = state.messages.find((m) => m.id === msg.id);
   if (item) item.read = read;
-  const unreadNow = Number($("unread").textContent || 0) + (read ? -1 : 1);
-  setUnread(Math.max(0, unreadNow));
+  adjustUnread(msg, read ? -1 : 1);
   renderList();
 }
 
@@ -174,6 +193,10 @@ function renderReader(msg) {
   $("r-date").textContent = formatDate(msg.date || msg.receivedAt);
   $("r-truncated").hidden = !msg.truncated;
   $("unread-btn").hidden = msg.direction !== "in";
+  $("spam-btn").hidden = msg.direction !== "in" || msg.isSpam;
+  $("reply-btn").hidden = Boolean(msg.isSpam); // replying to spam confirms your address is live
+  $("r-spam").hidden = !msg.isSpam;
+  $("r-spam-reasons").replaceChildren(...(msg.spamReasons || []).map((r) => el("li", "", r)));
   $("raw-btn").hidden = !msg.hasRaw;
 
   // Inline images (cid:) are shown inside the HTML; everything else is a download chip.
@@ -241,16 +264,88 @@ async function deleteCurrent() {
   if (!msg || !confirm("Delete this message permanently?")) return;
   await api(`/api/messages/${encodeURIComponent(msg.id)}`, { method: "DELETE" });
   state.messages = state.messages.filter((m) => m.id !== msg.id);
-  if (msg.direction === "in" && !msg.read) setUnread(Math.max(0, Number($("unread").textContent || 0) - 1));
+  if (msg.direction === "in" && !msg.read) adjustUnread(msg, -1);
   closeReader();
   renderList();
   toast("Message deleted");
+}
+
+// ---------- spam ----------
+
+async function moveSpam(spam) {
+  const msg = state.current;
+  if (!msg) return;
+  const res = await getJson(`/api/messages/${encodeURIComponent(msg.id)}/spam`, {
+    method: "POST",
+    body: JSON.stringify({ spam }),
+  });
+  if (!msg.read) adjustUnread(msg, -1);
+  state.messages = state.messages.filter((m) => m.id !== msg.id);
+  closeReader();
+  renderList();
+  const where = spam ? "Spam" : "Inbox";
+  toast(res.rule ? `Moved to ${where}. Future mail from ${res.rule} will go there too.` : `Moved to ${where}`);
+  // The message was unread-counted in the other folder; refresh counts.
+  loadCountsOnly().catch(handleError);
+}
+
+async function loadCountsOnly() {
+  const data = await getJson("/api/messages?limit=1");
+  setUnread(data.unread);
+  setSpamUnread(data.spamUnread);
+}
+
+async function openFilters() {
+  $("rule-error").hidden = true;
+  $("filters").showModal();
+  await renderRules();
+}
+
+async function renderRules() {
+  const { rules } = await getJson("/api/rules");
+  $("rule-empty").hidden = rules.length > 0;
+  $("rule-list").replaceChildren(
+    ...rules.map((r) => {
+      const li = document.createElement("li");
+      const remove = el("button", "ghost", "Remove");
+      remove.addEventListener("click", async () => {
+        try {
+          await api(`/api/rules/${encodeURIComponent(r.pattern)}`, { method: "DELETE" });
+          await renderRules();
+        } catch (err) {
+          handleError(err);
+        }
+      });
+      const label = { allow: "Allow", spam: "Spam", block: "Block" }[r.action];
+      li.append(el("span", "pattern", r.pattern), el("span", `rule-tag ${r.action}`, label), remove);
+      return li;
+    }),
+  );
+}
+
+async function addRule() {
+  $("rule-error").hidden = true;
+  try {
+    await getJson("/api/rules", {
+      method: "POST",
+      body: JSON.stringify({ pattern: $("rule-pattern").value, action: $("rule-action").value }),
+    });
+    $("rule-pattern").value = "";
+    await renderRules();
+  } catch (err) {
+    if (err instanceof AuthError) return handleError(err);
+    $("rule-error").textContent = err.message;
+    $("rule-error").hidden = false;
+  }
 }
 
 // ---------- compose / reply ----------
 
 function openCompose(replyTo = null) {
   state.replyTo = replyTo;
+  state.files = [];
+  renderFiles();
+  $("c-files").value = "";
   $("compose-title").textContent = replyTo ? "Reply" : "New message";
   $("compose-error").hidden = true;
   $("c-to").disabled = Boolean(replyTo);
@@ -273,23 +368,66 @@ function openCompose(replyTo = null) {
   if (replyTo) $("c-body").setSelectionRange(0, 0);
 }
 
+function addFiles(fileList) {
+  const next = [...state.files, ...fileList];
+  const total = next.reduce((sum, f) => sum + f.size, 0);
+  if (next.length > MAX_FILES) return toast(`You can attach up to ${MAX_FILES} files`);
+  if (total > MAX_FILE_BYTES) return toast("Attachments are limited to 10 MB in total");
+  state.files = next;
+  renderFiles();
+}
+
+function renderFiles() {
+  $("c-attachments").replaceChildren(
+    ...state.files.map((f, i) => {
+      const li = document.createElement("li");
+      const remove = el("button", "", "✕");
+      remove.type = "button";
+      remove.setAttribute("aria-label", `Remove ${f.name}`);
+      remove.addEventListener("click", () => {
+        state.files.splice(i, 1);
+        renderFiles();
+      });
+      li.append(el("span", "", `${f.name} (${formatSize(f.size)})`), remove);
+      return li;
+    }),
+  );
+}
+
+async function encodeFiles() {
+  return Promise.all(
+    state.files.map(async (f) => {
+      const dataUrl = await blobToDataUrl(f);
+      return { filename: f.name, type: f.type || "application/octet-stream", content: dataUrl.slice(dataUrl.indexOf(",") + 1) };
+    }),
+  );
+}
+
 async function sendCompose() {
   const text = $("c-body").value;
   const button = $("compose-send");
   button.disabled = true;
+  button.textContent = "Sending…";
   $("compose-error").hidden = true;
   try {
+    const attachments = state.files.length ? await encodeFiles() : undefined;
     if (state.replyTo) {
       await api(`/api/messages/${encodeURIComponent(state.replyTo.id)}/reply`, {
         method: "POST",
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, attachments }),
       });
     } else {
       const split = (s) => s.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean);
       const cc = split($("c-cc").value);
       await api("/api/send", {
         method: "POST",
-        body: JSON.stringify({ to: split($("c-to").value), cc: cc.length ? cc : undefined, subject: $("c-subject").value, text }),
+        body: JSON.stringify({
+          to: split($("c-to").value),
+          cc: cc.length ? cc : undefined,
+          subject: $("c-subject").value,
+          text,
+          attachments,
+        }),
       });
     }
     $("compose").close();
@@ -304,6 +442,7 @@ async function sendCompose() {
     $("compose-error").hidden = false;
   } finally {
     button.disabled = false;
+    button.textContent = "Send";
   }
 }
 
@@ -388,13 +527,13 @@ $("compose-form").addEventListener("submit", (e) => {
   sendCompose();
 });
 
-document.querySelectorAll(".folder").forEach((btn) =>
+document.querySelectorAll(".folder[data-folder]").forEach((btn) =>
   btn.addEventListener("click", () => {
     state.folder = btn.dataset.folder;
     state.cursor = undefined;
     state.query = "";
     $("search").value = "";
-    document.querySelectorAll(".folder").forEach((b) => b.setAttribute("aria-current", String(b === btn)));
+    document.querySelectorAll(".folder[data-folder]").forEach((b) => b.setAttribute("aria-current", String(b === btn)));
     closeReader();
     loadList().catch(handleError);
   }),
@@ -422,6 +561,18 @@ $("delete-btn").addEventListener("click", () => deleteCurrent().catch(handleErro
 $("raw-btn").addEventListener("click", () => {
   const msg = state.current;
   if (msg) downloadFile(`/api/messages/${encodeURIComponent(msg.id)}/raw`, `${msg.id}.eml`).catch(handleError);
+});
+$("spam-btn").addEventListener("click", () => moveSpam(true).catch(handleError));
+$("not-spam-btn").addEventListener("click", () => moveSpam(false).catch(handleError));
+$("filters-btn").addEventListener("click", () => openFilters().catch(handleError));
+$("filters-close").addEventListener("click", () => $("filters").close());
+$("rule-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  addRule();
+});
+$("c-files").addEventListener("change", (e) => {
+  addFiles([...e.target.files]);
+  e.target.value = "";
 });
 $("show-html").addEventListener("click", () => showBody("html"));
 $("show-text").addEventListener("click", () => showBody("text"));

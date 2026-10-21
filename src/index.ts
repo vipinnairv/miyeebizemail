@@ -22,6 +22,11 @@ export default {
     const days = Number(env.RETENTION_DAYS) || 30;
     const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
     const deleted = await purgeOlderThan(env, cutoff);
-    console.log(JSON.stringify({ event: "retention.purged", deleted, cutoff }));
+
+    // Spam is kept for a shorter time.
+    const spamDays = Number(env.SPAM_RETENTION_DAYS) || 30;
+    const spamCutoff = new Date(Date.now() - spamDays * 24 * 60 * 60 * 1000).toISOString();
+    const deletedSpam = await purgeOlderThan(env, spamCutoff, true);
+    console.log(JSON.stringify({ event: "retention.purged", deleted, deletedSpam, cutoff, spamCutoff }));
   },
 } satisfies ExportedHandler<Env>;

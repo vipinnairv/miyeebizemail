@@ -3,8 +3,9 @@
 A custom email app for your domain, running entirely in one Cloudflare Worker:
 
 - **Inbound:** Cloudflare Email Routing delivers mail to the Worker's `email` handler. The Worker keeps the original message in **R2**, parses it with [`postal-mime`](https://github.com/postalsys/postal-mime), saves attachments to **R2**, and indexes the message in **D1** with full-text search. It can also forward the mail to your mailbox and send an automatic acknowledgement.
-- **Outbound:** the `send_email` binding sends new messages and threaded replies, and keeps a copy in the Sent folder.
-- **Web inbox:** a page at `/` with Inbox and Sent folders, search, reading, attachment downloads, compose, reply, mark unread and delete. It works on phone and desktop, in light and dark mode.
+- **Spam filtering:** every inbound message is scored, and spam goes to a Spam folder with the reasons listed. Spam is never forwarded or auto-replied to. Per-sender **Allow / Spam / Block** rules override the score.
+- **Outbound:** the `send_email` binding sends new messages and threaded replies with **attachments**, and keeps a copy in the Sent folder.
+- **Web inbox:** a page at `/` with Inbox, Spam and Sent folders, search, reading, attachment downloads, compose with attachments, reply, mark spam / not spam, spam filters, mark unread and delete. It works on phone and desktop, in light and dark mode.
 - **API:** the JSON API the inbox uses, also available to scripts.
 - **Retention:** a daily cron job deletes messages, and their R2 files, older than `RETENTION_DAYS`.
 
@@ -30,11 +31,13 @@ A custom email app for your domain, running entirely in one Cloudflare Worker:
 | --- | --- |
 | `src/index.ts` | Worker entry: `email`, `fetch` and `scheduled` handlers |
 | `src/inbound.ts` | Store original → parse → attachments → D1 → forward → auto-reply |
-| `src/outbound.ts` | `sendEmail`, `replyToStored`, `sendAutoReply`, and the auto-reply loop guard |
+| `src/spam.ts` | Spam scoring and sender rules (allow / spam / block) |
+| `src/outbound.ts` | `sendEmail` (with attachments), `replyToStored`, `sendAutoReply`, and the auto-reply loop guard |
 | `src/db.ts` | All D1 queries: insert, list/search, paging, read state, delete, retention |
 | `src/api.ts` | HTTP API with bearer-token auth and safe downloads |
 | `src/env.ts` | Typed bindings and vars |
 | `migrations/0001_init.sql` | D1 schema: `messages`, `attachments`, and the `messages_fts` FTS5 index |
+| `migrations/0002_spam_filtering.sql` | Spam columns on `messages`, plus the `sender_rules` table |
 | `public/` | Web inbox (`index.html`, `app.js`, `styles.css`) and security headers (`_headers`) |
 | `wrangler.jsonc` | Worker config: D1, R2, `send_email`, static assets, cron, vars |
 
@@ -46,6 +49,35 @@ A custom email app for your domain, running entirely in one Cloudflare Worker:
 - **Isolated steps.** Each inbound step has its own error handling. If storage fails, forwarding and the auto-reply still run.
 - **Untrusted HTML mail.** The HTML body is shown in a sandboxed iframe: no scripts, and remote images (tracking pixels) are blocked by CSP. Inline `cid:` images still display. Attachments are only ever downloaded, never rendered on the app's own origin.
 - **No reply loops.** Auto-replies skip automated mail: `Auto-Submitted`, `List-Id`, `Precedence: bulk`, `noreply@`, `mailer-daemon@`, and your own domain.
+
+## Spam filtering
+
+Each inbound message gets points from the checks below (`src/spam.ts`). At `SPAM_THRESHOLD` points or more (default **5**) it goes to Spam.
+
+| Check | Points |
+| --- | --- |
+| Cloudflare's spam score (`X-Cf-Spamh-Score` header, 0–5) | 0–5 |
+| DMARC failed | 4 |
+| SPF failed / soft-failed | 2 / 1 |
+| DKIM failed | 1 |
+| Claims to be from your own domain but was sent from elsewhere | 5 |
+| Sender name shows a different email address (e.g. `"support@paypal.com" <x@evil.net>`) | 3 |
+| Dangerous attachment (`.exe`, `.scr`, `.js`, `.vbs`, `.iso`, …, including `invoice.pdf.exe`) | 5 each |
+| Link text shows one website but opens another (phishing) | 3 |
+| Reply-To goes to a different domain | 1 |
+| Subject mostly capitals / contains `!!!` or `$$$` | 1 each |
+| Common scam phrases ("you have won", "verify your account", …) | 1 each, max 3 |
+| No Message-ID | 1 |
+
+**Sender rules** (the **Spam filters** link in the inbox, or `/api/rules`) match an exact address (`bob@example.com`) or a whole domain (`@example.com`). An exact address beats a domain.
+
+- **Allow:** always Inbox. Ignored when the message is provably forged (DMARC failure, or pretending to be from your domain), because the From header can be faked.
+- **Spam:** always Spam.
+- **Block:** the email is rejected during delivery and nothing is stored.
+
+Clicking **Spam** or **Not spam** on a message moves it and adds a Spam or Allow rule for that sender, so the filter learns.
+
+Tuning: set `SPAM_THRESHOLD` lower (e.g. `4`) to be stricter or higher (e.g. `7`) to be more relaxed, then redeploy. Spam is deleted after `SPAM_RETENTION_DAYS` (default 30).
 
 ## 1. Local setup
 
@@ -134,14 +166,20 @@ All `/api/*` routes need `Authorization: Bearer <API_TOKEN>`.
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/health` | Liveness check (no auth) |
-| GET | `/api/messages?folder=inbox\|sent&q=&limit=30&cursor=` | Newest-first summaries plus `unread` count; `q` is full-text search; pass the returned `cursor` for the next page |
+| GET | `/api/messages?folder=inbox\|spam\|sent&q=&limit=30&cursor=` | Newest-first summaries plus `unread` / `spamUnread` counts; `q` is full-text search; pass the returned `cursor` for the next page |
 | GET | `/api/messages/:id` | Full message (text, html, attachments) |
 | PATCH | `/api/messages/:id` | `{ "read": true \| false }` |
 | DELETE | `/api/messages/:id` | Delete message, attachments and original |
 | GET | `/api/messages/:id/raw` | Download original `.eml` |
-| POST | `/api/messages/:id/reply` | `{ "text", "html"? }`: threaded reply to the sender |
+| POST | `/api/messages/:id/reply` | `{ "text", "html"?, "attachments"? }`: threaded reply to the sender |
+| POST | `/api/messages/:id/spam` | `{ "spam": true \| false, "rememberSender"?: true }`: move to Spam / Inbox and add a sender rule |
 | GET | `/api/attachments/:id` | Download an attachment |
-| POST | `/api/send` | `{ "to", "subject", "text"?, "html"?, "cc"?, "replyTo"? }` |
+| POST | `/api/send` | `{ "to", "subject", "text"?, "html"?, "cc"?, "replyTo"?, "attachments"? }` |
+| GET | `/api/rules` | List sender rules |
+| POST | `/api/rules` | `{ "pattern": "a@b.com" \| "@b.com", "action": "allow" \| "spam" \| "block" }` |
+| DELETE | `/api/rules/:pattern` | Remove a rule (URL-encode the pattern) |
+
+`attachments` is a list of `{ "filename", "type", "content" }` with base64 `content`, at most 10 files and 10 MB in total.
 
 ## Configuration
 
@@ -154,10 +192,11 @@ All `/api/*` routes need `Authorization: Bearer <API_TOKEN>`.
 | `FORWARD_TO` | var | Verified mailbox to forward inbound mail to (`""` = off) |
 | `AUTO_REPLY` | var | `"true"` to send acknowledgements |
 | `RETENTION_DAYS` | var | Messages older than this are deleted daily (default 90) |
+| `SPAM_THRESHOLD` | var | Score at which mail goes to Spam (default 5) |
+| `SPAM_RETENTION_DAYS` | var | Spam older than this is deleted daily (default 30) |
 | `API_TOKEN` | secret | Bearer token for the API and web inbox |
 
 ## Ideas for later
 
 - Use **Workers AI** to classify or summarize inbound mail as it arrives.
-- Add attachments to compose (upload to R2, pass to `env.EMAIL.send({ attachments })`).
 - Add a "load remote images" button for trusted senders.

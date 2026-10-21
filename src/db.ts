@@ -1,6 +1,7 @@
 import type { Env } from "./env";
 
 export type Direction = "in" | "out";
+export type Folder = "inbox" | "spam" | "sent";
 
 /** A message as written to / read from D1. */
 export interface MessageRecord {
@@ -26,6 +27,9 @@ export interface MessageRecord {
   /** Set when a body was cut to fit D1's row size limit, or the message was too large to parse. */
   truncated: boolean;
   read: boolean;
+  isSpam?: boolean;
+  spamScore?: number;
+  spamReasons?: string[];
 }
 
 export interface AttachmentRecord {
@@ -48,6 +52,7 @@ export interface MessageSummary {
   subject: string;
   snippet: string;
   read: boolean;
+  isSpam: boolean;
   attachmentCount: number;
 }
 
@@ -64,8 +69,8 @@ export async function insertMessage(env: Env, msg: MessageRecord, attachments: A
     env.DB.prepare(
       `INSERT INTO messages (id, direction, received_at, envelope_from, envelope_to, from_addr, from_email,
          reply_to, to_addrs, cc_addrs, subject, message_id, in_reply_to, references_hdr, sent_date,
-         text, html, snippet, raw_key, raw_size, truncated, is_read)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         text, html, snippet, raw_key, raw_size, truncated, is_read, is_spam, spam_score, spam_reasons)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       msg.id,
       msg.direction,
@@ -89,6 +94,9 @@ export async function insertMessage(env: Env, msg: MessageRecord, attachments: A
       msg.rawSize,
       truncated ? 1 : 0,
       msg.read ? 1 : 0,
+      msg.isSpam ? 1 : 0,
+      msg.spamScore ?? 0,
+      JSON.stringify(msg.spamReasons ?? []),
     ),
     ...attachments.map((a) =>
       env.DB.prepare(
@@ -102,7 +110,7 @@ export async function insertMessage(env: Env, msg: MessageRecord, attachments: A
 }
 
 export interface ListOptions {
-  direction: Direction;
+  folder: Folder;
   query?: string;
   limit: number;
   /** Opaque cursor returned by a previous call. */
@@ -113,8 +121,8 @@ export async function listMessages(
   env: Env,
   opts: ListOptions,
 ): Promise<{ messages: MessageSummary[]; cursor?: string }> {
-  const where = ["m.direction = ?"];
-  const params: unknown[] = [opts.direction];
+  const where = ["m.direction = ?", "m.is_spam = ?"];
+  const params: unknown[] = [opts.folder === "sent" ? "out" : "in", opts.folder === "spam" ? 1 : 0];
   let join = "";
 
   const match = opts.query ? toFtsQuery(opts.query) : "";
@@ -132,7 +140,7 @@ export async function listMessages(
 
   // Fetch one extra row to know whether another page exists.
   const { results } = await env.DB.prepare(
-    `SELECT m.id, m.direction, m.received_at, m.from_addr, m.to_addrs, m.subject, m.snippet, m.is_read,
+    `SELECT m.id, m.direction, m.received_at, m.from_addr, m.to_addrs, m.subject, m.snippet, m.is_read, m.is_spam,
        (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id AND a.content_id IS NULL) AS attachment_count
      FROM messages m ${join}
      WHERE ${where.join(" AND ")}
@@ -152,6 +160,7 @@ export async function listMessages(
       subject: r.subject as string,
       snippet: r.snippet as string,
       read: r.is_read === 1,
+      isSpam: r.is_spam === 1,
       attachmentCount: r.attachment_count as number,
     }),
   );
@@ -162,11 +171,13 @@ export async function listMessages(
   };
 }
 
-export async function countUnread(env: Env): Promise<number> {
-  const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM messages WHERE direction = 'in' AND is_read = 0").first<{
-    n: number;
-  }>();
-  return row?.n ?? 0;
+/** Unread counts for the Inbox and Spam folders. */
+export async function countUnread(env: Env): Promise<{ inbox: number; spam: number }> {
+  const row = await env.DB.prepare(
+    `SELECT COALESCE(SUM(is_spam = 0), 0) AS inbox, COALESCE(SUM(is_spam = 1), 0) AS spam
+     FROM messages WHERE direction = 'in' AND is_read = 0`,
+  ).first<{ inbox: number; spam: number }>();
+  return { inbox: row?.inbox ?? 0, spam: row?.spam ?? 0 };
 }
 
 export async function getMessage(
@@ -201,6 +212,9 @@ export async function getMessage(
     rawSize: r.raw_size as number,
     truncated: r.truncated === 1,
     read: r.is_read === 1,
+    isSpam: r.is_spam === 1,
+    spamScore: r.spam_score as number,
+    spamReasons: parseJsonArray(r.spam_reasons),
     attachments: attRes.results.map((a) => ({
       id: a.id as string,
       messageId: a.message_id as string,
@@ -233,6 +247,17 @@ export async function setRead(env: Env, id: string, read: boolean): Promise<bool
   return res.meta.changes > 0;
 }
 
+/** Move an inbound message between Inbox and Spam. Returns its sender address, or null if not found. */
+export async function setSpam(env: Env, id: string, spam: boolean): Promise<string | null> {
+  const row = await env.DB.prepare(
+    "UPDATE messages SET is_spam = ? WHERE id = ? AND direction = 'in' RETURNING from_email, envelope_from",
+  )
+    .bind(spam ? 1 : 0, id)
+    .first<{ from_email: string | null; envelope_from: string | null }>();
+  if (!row) return null;
+  return (row.from_email || row.envelope_from || "").toLowerCase();
+}
+
 /** Deletes messages (attachments cascade) and their R2 objects. Returns how many messages were removed. */
 export async function deleteMessages(env: Env, ids: string[]): Promise<number> {
   if (ids.length === 0) return 0;
@@ -253,12 +278,11 @@ export async function deleteMessages(env: Env, ids: string[]): Promise<number> {
 }
 
 /** Retention cleanup, called from the cron trigger. Works in batches to stay within limits. */
-export async function purgeOlderThan(env: Env, cutoffIso: string): Promise<number> {
+export async function purgeOlderThan(env: Env, cutoffIso: string, onlySpam = false): Promise<number> {
   let total = 0;
+  const sql = `SELECT id FROM messages WHERE received_at < ?${onlySpam ? " AND is_spam = 1" : ""} LIMIT 50`;
   for (let round = 0; round < 20; round++) {
-    const { results } = await env.DB.prepare("SELECT id FROM messages WHERE received_at < ? LIMIT 50")
-      .bind(cutoffIso)
-      .all<{ id: string }>();
+    const { results } = await env.DB.prepare(sql).bind(cutoffIso).all<{ id: string }>();
     if (results.length === 0) break;
     total += await deleteMessages(
       env,

@@ -2,6 +2,7 @@ import PostalMime, { type Address, type Email } from "postal-mime";
 import type { Env } from "./env";
 import { insertMessage, type AttachmentRecord, type MessageRecord } from "./db";
 import { sendAutoReply, shouldAutoReply } from "./outbound";
+import { classify, senderOf, type SpamVerdict } from "./spam";
 
 // Messages larger than this are kept as raw .eml only (headers in D1) to stay within Worker CPU/memory limits.
 const MAX_PARSE_BYTES = 10 * 1024 * 1024;
@@ -9,29 +10,40 @@ const MAX_PARSE_BYTES = 10 * 1024 * 1024;
 /**
  * Entry point for mail delivered by Email Routing.
  *
- * Steps: save original to R2 -> parse -> attachments to R2 -> row in D1 -> forward -> auto-reply.
+ * Steps: parse -> spam check -> (blocked: reject) -> original + attachments to R2 -> row in D1
+ *        -> forward -> auto-reply. Spam is stored in the Spam folder and is never forwarded or answered.
  * Each side effect is isolated so that, e.g., a storage failure doesn't stop forwarding.
  */
 export async function handleInbound(message: ForwardableEmailMessage, env: Env): Promise<void> {
   const id = crypto.randomUUID();
   let subject = message.headers.get("subject") ?? "";
+  let verdict: SpamVerdict | undefined;
 
   try {
-    const stored = await storeInbound(message, env, id);
-    subject = stored.subject;
+    const result = await processInbound(message, env, id);
+    verdict = result.verdict;
+    subject = result.subject;
     console.log(
       JSON.stringify({
-        event: "email.received",
+        event: verdict.action === "block" ? "email.rejected" : "email.received",
         id,
-        from: stored.from,
+        from: result.from,
         to: message.to,
-        subject: stored.subject,
+        subject,
         size: message.rawSize,
+        spam: verdict.action,
+        spamScore: verdict.score,
       }),
     );
   } catch (err) {
     console.error("Failed to store email", id, err);
   }
+
+  if (verdict?.action === "block") {
+    message.setReject("Message rejected by recipient");
+    return;
+  }
+  if (verdict?.action === "spam") return;
 
   if (env.FORWARD_TO) {
     try {
@@ -52,9 +64,34 @@ export async function handleInbound(message: ForwardableEmailMessage, env: Env):
   }
 }
 
-async function storeInbound(message: ForwardableEmailMessage, env: Env, id: string): Promise<MessageRecord> {
+async function processInbound(
+  message: ForwardableEmailMessage,
+  env: Env,
+  id: string,
+): Promise<{ verdict: SpamVerdict; subject: string; from: string }> {
   // `message.raw` can only be read once, so buffer it: we need it for both R2 and the parser.
   const raw = await new Response(message.raw).arrayBuffer();
+  const h = message.headers;
+  const parsed = raw.byteLength > MAX_PARSE_BYTES ? null : await PostalMime.parse(raw);
+
+  const sender = parsed ? senderOf(parsed) : { email: message.from };
+  const subject = parsed ? (parsed.subject ?? "") : (h.get("subject") ?? "");
+  const verdict = await classify(env, {
+    headers: h,
+    envelopeFrom: message.from,
+    fromEmail: sender.email,
+    fromName: sender.name,
+    replyTo: firstMailbox(parsed?.replyTo?.[0]),
+    subject,
+    text: parsed?.text,
+    html: parsed?.html,
+    attachments: parsed?.attachments ?? [],
+  });
+  const from = parsed?.from ? formatAddress(parsed.from) : (h.get("from") ?? message.from);
+
+  // Blocked senders: nothing is stored.
+  if (verdict.action === "block") return { verdict, subject, from };
+
   const rawKey = `raw/${id}.eml`;
   await env.MAIL_BUCKET.put(rawKey, raw, { httpMetadata: { contentType: "message/rfc822" } });
 
@@ -67,38 +104,36 @@ async function storeInbound(message: ForwardableEmailMessage, env: Env, id: stri
     rawKey,
     rawSize: message.rawSize,
     read: false,
+    isSpam: verdict.action === "spam",
+    spamScore: verdict.score,
+    spamReasons: verdict.reasons,
   };
 
-  if (raw.byteLength > MAX_PARSE_BYTES) {
-    const h = message.headers;
-    const record: MessageRecord = {
+  if (!parsed) {
+    await insertMessage(env, {
       ...base,
-      from: h.get("from") ?? message.from,
+      from,
       fromEmail: message.from,
       to: [h.get("to") ?? message.to],
       cc: [],
-      subject: h.get("subject") ?? "",
+      subject,
       messageId: h.get("message-id") ?? undefined,
       date: h.get("date") ?? undefined,
       text: "This message was too large to display. Download the original to read it.",
       truncated: true,
-    };
-    await insertMessage(env, record);
-    return record;
+    });
+    return { verdict, subject, from };
   }
 
-  const parsed = await PostalMime.parse(raw);
   const attachments = await storeAttachments(env, id, parsed);
-  const fromMailbox = firstMailbox(parsed.from);
-
   const record: MessageRecord = {
     ...base,
-    from: parsed.from ? formatAddress(parsed.from) : message.from,
-    fromEmail: fromMailbox ?? message.from,
+    from,
+    fromEmail: sender.email ?? message.from,
     replyTo: firstMailbox(parsed.replyTo?.[0]),
     to: (parsed.to ?? []).map(formatAddress),
     cc: (parsed.cc ?? []).map(formatAddress),
-    subject: parsed.subject ?? "",
+    subject,
     messageId: parsed.messageId,
     inReplyTo: parsed.inReplyTo,
     references: parsed.references,
@@ -108,7 +143,7 @@ async function storeInbound(message: ForwardableEmailMessage, env: Env, id: stri
     truncated: false,
   };
   await insertMessage(env, record, attachments);
-  return record;
+  return { verdict, subject, from };
 }
 
 async function storeAttachments(env: Env, messageId: string, parsed: Email): Promise<AttachmentRecord[]> {

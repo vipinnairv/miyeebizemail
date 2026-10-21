@@ -1,20 +1,27 @@
 import type { Env } from "./env";
-import { countUnread, deleteMessages, getAttachment, getMessage, listMessages, setRead } from "./db";
-import { replyToStored, sendEmail, type OutgoingEmail } from "./outbound";
+import { countUnread, deleteMessages, getAttachment, getMessage, listMessages, setRead, setSpam, type Folder } from "./db";
+import { replyToStored, sendEmail, validateAttachments, type OutgoingAttachment, type OutgoingEmail } from "./outbound";
+import { deleteSenderRule, listSenderRules, normalizePattern, setSenderRule, type RuleAction } from "./spam";
 
 /**
  * JSON API used by the web inbox (public/) and by scripts.
  *
  *   GET    /health                          liveness check (no auth)
  *   GET    /api/messages?folder=&q=&limit=&cursor=
- *                                           newest-first summaries; folder = inbox | sent, q = full-text search
+ *                                           newest-first summaries; folder = inbox | spam | sent, q = full-text search
  *   GET    /api/messages/:id                full message with attachment list
  *   PATCH  /api/messages/:id                { "read": true | false }
  *   DELETE /api/messages/:id                delete message, attachments and original
  *   GET    /api/messages/:id/raw            original .eml (inbound only)
- *   POST   /api/messages/:id/reply          { "text", "html"? } threaded reply
+ *   POST   /api/messages/:id/reply          { "text", "html"?, "attachments"? } threaded reply
+ *   POST   /api/messages/:id/spam           { "spam": bool, "rememberSender"?: bool } move to Spam / Inbox
  *   GET    /api/attachments/:id             attachment download
- *   POST   /api/send                        { "to", "subject", "text"?, "html"?, "cc"?, "replyTo"? }
+ *   POST   /api/send                        { "to", "subject", "text"?, "html"?, "cc"?, "replyTo"?, "attachments"? }
+ *   GET    /api/rules                       sender rules (allow / spam / block)
+ *   POST   /api/rules                       { "pattern": "a@b.com" | "@b.com", "action" }
+ *   DELETE /api/rules/:pattern              remove a rule
+ *
+ * Attachments are { "filename", "type", "content" } with base64 content.
  *
  * All /api routes require `Authorization: Bearer <API_TOKEN>`.
  */
@@ -32,18 +39,19 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
 
   try {
     if (pathname === "/api/messages" && method === "GET") {
-      const folder = url.searchParams.get("folder") === "sent" ? "out" : "in";
+      const requested = url.searchParams.get("folder");
+      const folder: Folder = requested === "sent" || requested === "spam" ? requested : "inbox";
       const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 30, 1), 100);
       const [page, unread] = await Promise.all([
         listMessages(env, {
-          direction: folder,
+          folder,
           query: url.searchParams.get("q") ?? undefined,
           limit,
           cursor: url.searchParams.get("cursor") ?? undefined,
         }),
         countUnread(env),
       ]);
-      return json({ ...page, unread });
+      return json({ ...page, unread: unread.inbox, spamUnread: unread.spam });
     }
 
     if (pathname === "/api/send" && method === "POST") {
@@ -54,7 +62,24 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
       return json({ sent: true, id: sent.id, messageId: sent.messageId });
     }
 
-    let m = pathname.match(/^\/api\/messages\/([\w-]+)(\/raw|\/reply)?$/);
+    if (pathname === "/api/rules" && method === "GET") {
+      return json({ rules: await listSenderRules(env) });
+    }
+    if (pathname === "/api/rules" && method === "POST") {
+      const body = await readJson<{ pattern?: unknown; action?: unknown }>(request);
+      const pattern = typeof body?.pattern === "string" ? normalizePattern(body.pattern) : null;
+      if (!pattern) return json({ error: "`pattern` must be an address (a@b.com) or a domain (@b.com)" }, 400);
+      if (!isRuleAction(body?.action)) return json({ error: "`action` must be allow, spam or block" }, 400);
+      await setSenderRule(env, pattern, body.action);
+      return json({ pattern, action: body.action });
+    }
+    const rule = pathname.match(/^\/api\/rules\/(.+)$/);
+    if (rule && method === "DELETE") {
+      const pattern = decodeURIComponent(rule[1]).toLowerCase();
+      return (await deleteSenderRule(env, pattern)) ? json({ deleted: pattern }) : notFound();
+    }
+
+    let m = pathname.match(/^\/api\/messages\/([\w-]+)(\/raw|\/reply|\/spam)?$/);
     if (m) {
       const [, id, sub] = m;
 
@@ -79,14 +104,33 @@ export async function handleApi(request: Request, env: Env): Promise<Response> {
         return download(obj.body, "message/rfc822", `${id}.eml`);
       }
       if (sub === "/reply" && method === "POST") {
-        const body = await readJson<{ text?: unknown; html?: unknown }>(request);
+        const body = await readJson<{ text?: unknown; html?: unknown; attachments?: unknown }>(request);
         const text = typeof body?.text === "string" ? body.text : undefined;
         const html = typeof body?.html === "string" ? body.html : undefined;
         if (!text?.trim() && !html?.trim()) return json({ error: "Provide `text` and/or `html`" }, 400);
+        const attachmentError = validateAttachments(body?.attachments);
+        if (attachmentError) return json({ error: attachmentError }, 400);
         const original = await getMessage(env, id);
         if (!original) return notFound();
-        const sent = await replyToStored(env, original, { text, html });
+        const attachments = body?.attachments as OutgoingAttachment[] | undefined;
+        const sent = await replyToStored(env, original, { text, html, attachments });
         return json({ sent: true, id: sent.id, messageId: sent.messageId });
+      }
+      if (sub === "/spam" && method === "POST") {
+        const body = await readJson<{ spam?: unknown; rememberSender?: unknown }>(request);
+        if (typeof body?.spam !== "boolean") return json({ error: "`spam` must be a boolean" }, 400);
+        const sender = await setSpam(env, id, body.spam);
+        if (sender === null) return notFound();
+        // By default, teach the filter: future mail from this sender follows the same choice.
+        let rule: string | undefined;
+        if (body.rememberSender !== false && sender) {
+          const pattern = normalizePattern(sender);
+          if (pattern) {
+            await setSenderRule(env, pattern, body.spam ? "spam" : "allow");
+            rule = pattern;
+          }
+        }
+        return json({ id, spam: body.spam, rule });
       }
     }
 
@@ -115,7 +159,11 @@ function validateOutgoing(body: Partial<OutgoingEmail> | null): string | null {
   if (body.replyTo !== undefined && !isEmail(body.replyTo)) return "`replyTo` must be an email address";
   if (typeof body.subject !== "string" || !body.subject.trim()) return "`subject` is required";
   if (!body.text && !body.html) return "Provide `text` and/or `html`";
-  return null;
+  return validateAttachments(body.attachments);
+}
+
+function isRuleAction(value: unknown): value is RuleAction {
+  return value === "allow" || value === "spam" || value === "block";
 }
 
 async function isAuthorized(request: Request, env: Env): Promise<boolean> {
