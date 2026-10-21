@@ -8,6 +8,10 @@
   // and in `npx wrangler tail`.
   "observability": { "enabled": true },
 
+  // The web inbox is served at https://mail.miyeetechlabs.com. `wrangler deploy`
+  // creates this custom domain (and its DNS record) automatically.
+  "routes": [{ "pattern": "mail.miyeetechlabs.com", "custom_domain": true }],
+
   // The web inbox (public/) is served as static assets. Requests that don't
   // match a file (e.g. /api/*) fall through to the Worker's fetch handler.
   "assets": { "directory": "./public" },
@@ -17,8 +21,8 @@
   "vars": {
     // The address this Worker sends mail from. Must be on a domain that is
     // onboarded to Cloudflare Email Routing / Email Sending.
-    "FROM_ADDRESS": "hello@example.com",
-    "FROM_NAME": "Example Support",
+    "FROM_ADDRESS": "hello@miyeetechlabs.com",
+    "FROM_NAME": "Miyee Tech Labs",
     // Optional: copy every inbound message to this mailbox. It must be a
     // *verified destination address* in Email Routing. Leave "" to disable.
     "FORWARD_TO": "",
@@ -50,7 +54,7 @@
   "send_email": [
     {
       "name": "EMAIL",
-      "allowed_sender_addresses": ["hello@example.com"]
+      "allowed_sender_addresses": ["hello@miyeetechlabs.com"]
     }
   ],
 
