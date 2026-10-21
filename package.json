@@ -1,0 +1,21 @@
+{
+  "name": "miyeebizemail",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "check": "tsc --noEmit && wrangler deploy --dry-run --outdir dist",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "postal-mime": "^4.0.11"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261021.1",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.151.3"
+  }
+}

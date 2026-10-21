@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "miyeebizemail",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+
+  // Logs from console.log() show up in the dashboard (Workers > Observability)
+  // and in `npx wrangler tail`.
+  "observability": { "enabled": true },
+
+  // Plain (non-secret) configuration. Secrets such as API_TOKEN are set with
+  // `npx wrangler secret put API_TOKEN` and are NOT listed here.
+  "vars": {
+    // The address this Worker sends mail from. Must be on a domain that is
+    // onboarded to Cloudflare Email Routing / Email Sending.
+    "FROM_ADDRESS": "hello@example.com",
+    "FROM_NAME": "Example Support",
+    // Optional: copy every inbound message to this mailbox. It must be a
+    // *verified destination address* in Email Routing. Leave "" to disable.
+    "FORWARD_TO": "",
+    // Send an automatic acknowledgement to whoever emails you.
+    "AUTO_REPLY": "true",
+    // How long parsed messages are kept in KV.
+    "RETENTION_DAYS": "30"
+  },
+
+  // KV namespace that stores parsed inbound messages.
+  // Create it with `npx wrangler kv namespace create EMAIL_LOG` and paste the id.
+  "kv_namespaces": [
+    { "binding": "EMAIL_LOG", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }
+  ],
+
+  // Outbound email binding (env.EMAIL.send(...)).
+  // Restrict which From addresses this Worker may use. You can also add
+  // "destination_address" or "allowed_destination_addresses" to lock the
+  // binding to specific verified recipients (useful for notification-only Workers).
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "allowed_sender_addresses": ["hello@example.com"]
+    }
+  ]
+}
